@@ -1,67 +1,86 @@
 #!/bin/bash
-# Copyright (C) Jörg Binnewald. All rights reserved.  
+
+# device ID
+DISK="/dev/disk/by-id/scsi-SST5000DM_000-xxx" #5000GB Seagate
 
 # Pool mit den zu sichernden Daten
-MASTERPOOL="ZRAID5"
+MASTERPOOL="poolz8tb"
 
 # Backup-Pool
-BACKUPPOOL="EXTBACKUP"
+BACKUPPOOL="backup5000"
 
 # Datasets, die in das Backup sollen
-DATASETS=("data" "home")
+DATASETS=("Audio" "Downloads" "Serien")
 
 # Anzahl der zu behaltenden letzten Snapshots, mindestens 1
-KEEPOLD=3
+KEEPOLD=1
 
 # Praefix fuer Snapshot-Namen
-PREFIX="offsite"
+PREFIX="usb"
+
+# Debug
+# DATASET=Audio
+# zfs load-key -L file:///root/zfs_key_5tb backup5000/Audio
+# zfs mount backup5000/Audio
+# zfs list -rt bookmark
+# zfs list -rt snap
 
 # -------------- ab hier nichts aendern ---------------
 
-zpool import $BACKUPPOOL
+zpool import $BACKUPPOOL 2> /dev/null
 
-KEEPOLD=$(($KEEPOLD + 1))
+# Setup
+if [ $? -ne 0 ] 
+    then
+        if (whiptail --title "$BACKUPPOOL not found" --yesno "Create $BACKUPPOOL on device $DISK?" 8 78); then
+            echo "Creating pool $BACKUPPOOL on device $DISK"
+            zpool create $BACKUPPOOL $DISK
+        else
+            echo "Aborting"
+            exit 1
+        fi
+fi
 
 for DATASET in ${DATASETS[@]}
 do
     # Namen des aktuellsten Snapshots aus dem Backup holen
-	recentBSnap=$(zfs list -rt snap -H -o name "${BACKUPPOOL}/${DATASET}" | grep "@${PREFIX}-" | tail -1 | cut -d@ -f2)
-	if [ -z "$recentBSnap" ] 
-		then
-			dialog --title "Kein Snapshot gefunden" --yesno "Es existiert kein Backup-Snapshot in ${BACKUPPOOL}/${DATASET}. Soll ein neues Backup angelegt werden? (Vorhandene Daten in ${BACKUPPOOL}/${DATASET} werden ueberschrieben.)" 15 60
-			ANTWORT=${?}
-			if [ "$ANTWORT" -eq "0" ]
-				then
-					# Backup initialisieren
-					NEWSNAP="${MASTERPOOL}/${DATASET}@${PREFIX}-$(date '+%Y%m%d-%H%M%S')"
-					zfs snapshot -r $NEWSNAP
-					zfs send -v $NEWSNAP | zfs recv -F "${BACKUPPOOL}/${DATASET}"
-			fi
-			continue
-	fi
-	
-	# Check ob der korrespondierende Snapshot im Master-Pool existiert
-	origBSnap=$(zfs list -rt snap -H -o name "${MASTERPOOL}/${DATASET}" | grep $recentBSnap | cut -d@ -f2)
-	if [ "$recentBSnap" != "$origBSnap" ]
-		then
-			echo "Fehler: Zum letzten Backup-Spanshot ${recentBSnap} existiert im Master-Pool kein zugehoeriger Snapshot."
-			continue
-	fi
-	
-	echo "aktuellster Snapshot im Backup: ${BACKUPPOOL}/${DATASET}@${recentBSnap}"
-	
-	# Name fuer neuen Snapshot
-	NEWSNAP="${MASTERPOOL}/${DATASET}@${PREFIX}-$(date '+%Y%m%d-%H%M%S')"
-	# neuen Snapshot anlegen
-	zfs snapshot -r $NEWSNAP
-	echo "neuen Snapshot angelegt: ${NEWSNAP}"
-	
-	# neuen Snapshot senden
-	zfs send -v -i $recentBSnap $NEWSNAP | zfs recv "${BACKUPPOOL}/${DATASET}"
-	
-	# alte Snapshots loeschen
-	zfs list -rt snap -H -o name "${BACKUPPOOL}/${DATASET}" | grep "@${PREFIX}-" | tac | tail +$KEEPOLD | xargs -n 1 zfs destroy -r
-    zfs list -rt snap -H -o name "${MASTERPOOL}/${DATASET}" | grep "@${PREFIX}-" | tac | tail +$KEEPOLD | xargs -n 1 zfs destroy -r
+    recentBSnap=$(zfs list -rt snap -H -o name "${BACKUPPOOL}/${DATASET}" | grep "@${PREFIX}-" | tail -1 | cut -d@ -f2)
+    if [ -z "$recentBSnap" ] 
+        then
+            # Kein Snapshot gefunden
+            # Backup initialisieren
+            _NAME="${PREFIX}-$(date '+%Y-%m-%d-%H:%M:%S')"
+            NEWSNAP="${MASTERPOOL}/${DATASET}@${_NAME}"
+            BOOKMARK="#${_NAME}"
+            zfs snapshot -r "$NEWSNAP"
+            zfs bookmark "$NEWSNAP" "$BOOKMARK"
+            zfs send -v -w "$NEWSNAP" | zfs recv -v -d -F "${BACKUPPOOL}"   
+            zfs destroy "$NEWSNAP" #save space
+            continue #with next dataset         
+    fi
+
+	OLDBOOKMARK=$(zfs list -rt bookmark -H -o name "${MASTERPOOL}/${DATASET}" | grep $recentBSnap | cut -d@ -f2)
+   
+    # Check ob der korrespondierende Bookmark im Master-Pool existiert
+    if [ -z "$OLDBOOKMARK" ]
+        then
+            echo "Fehler: Zum letzten Backup-Spanshot ${recentBSnap} existiert im Master-Pool kein zugehoeriger Bookmark."
+            continue
+    fi
+    
+    echo "aktuellster Snapshot im Backup: ${BACKUPPOOL}/${DATASET}@${recentBSnap}"
+    
+    _SNAPNAME="${PREFIX}-$(date '+%Y-%m-%d-%H:%M:%S')"
+    NEWSNAP="${MASTERPOOL}/${DATASET}@${_SNAPNAME}"
+    BOOKMARK="#${_SNAPNAME}"
+    zfs snapshot -r "$NEWSNAP"
+    zfs bookmark "$NEWSNAP" "$BOOKMARK"
+    zfs send -v -w -i "$OLDBOOKMARK" "$NEWSNAP" | zfs recv -v -d -F "${BACKUPPOOL}"
+    zfs destroy "$NEWSNAP" #save space
+
+    #cleanup old
+   	zfs list -rt snap -H -o name "${BACKUPPOOL}/${DATASET}" | grep "@${PREFIX}-" | head -n -$KEEPOLD | xargs -n 1 zfs destroy -r
+
 done
 
 zpool export $BACKUPPOOL
